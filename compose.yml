@@ -1,0 +1,50 @@
+# Optional split topology. Engine and API stay on the official image so a
+# sidecar tweak does not reload 115 GiB of weights. The sidecar is the same
+# wrapped image running in standalone-proxy mode.
+#
+#   HALOGEN_MODELS=/path/to/weights docker compose up
+#
+# llama-swap should target http://127.0.0.1:8731/v1
+
+x-halogen-devices: &halogen-devices
+  devices:
+    - /dev/kfd
+    - /dev/dri
+  security_opt: [seccomp:unconfined]
+  ipc: host
+  ulimits:
+    memlock: -1
+  group_add: [keep-groups]
+
+services:
+  engine:
+    image: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.1}
+    command: ["engine"]
+    environment:
+      HALOGEN_BIND: 0.0.0.0
+      HALOGEN_VISION_TOWER: ${HALOGEN_VISION_TOWER:-}
+    volumes:
+      - ${HALOGEN_MODELS:?set HALOGEN_MODELS}:/models:ro
+    <<: *halogen-devices
+
+  api:
+    image: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.1}
+    command: ["api"]
+    depends_on: [engine]
+    environment:
+      HALOGEN_ENGINE: engine:8730
+    volumes:
+      - ${HALOGEN_MODELS:?set HALOGEN_MODELS}:/models:ro
+    # Intentionally unpublished. llama-swap talks to `sidecar`.
+
+  sidecar:
+    build:
+      context: .
+      args:
+        HALOGEN_IMAGE: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.1}
+    environment:
+      HALOGEN_SIDECAR_UPSTREAM: api:8731
+      HALOGEN_SIDECAR_LISTEN: 0.0.0.0:8731
+    ports:
+      - "8731:8731"
+    depends_on: [api]

@@ -1,0 +1,31 @@
+[project]
+name = "halogen-timings-sidecar"
+version = "0.1.0"
+description = "Drop-in front-end for halogen-flash-server that forges llama.cpp timings on the final SSE chunk so llama-swap can show prefill/decode tok/s."
+requires-python = ">=3.10"
+
+# The proxy itself is stdlib-only. Everything below is dev tooling.
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # line length is the formatter's job; long regex strings stay
+    "SIM105",  # contextlib.suppress over try/except/pass is less readable here
+    "B014",  # deliberate redundant exception classes for readability at call sites
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

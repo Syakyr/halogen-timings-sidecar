@@ -1,0 +1,39 @@
+name: watch-halogen
+
+# Watches peonist-ai/halogen-flash-server for new releases and auto-tags
+# <version>-sidecar1, which triggers build.yml. Halogen ships several
+# releases per day; every 6 hours keeps lag low without wasting runs.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag-new-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Tag newest upstream release if not yet built
+        run: |
+          set -euo pipefail
+          LATEST="$(
+            curl -fsSL \
+              https://api.github.com/repos/peonist-ai/halogen-flash-server/tags \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["name"].lstrip("v"))'
+          )"
+          TAG="${LATEST}-sidecar1"
+          echo "newest upstream halogen: ${LATEST}"
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "${TAG} already exists; nothing to do"
+            exit 0
+          fi
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "pushed ${TAG}; build.yml will publish the image"
