@@ -67,12 +67,15 @@ jobs:
           )"
           IS_LATEST=no
           [ "$HALOGEN" = "$LATEST_UPSTREAM" ] && IS_LATEST=yes
+          # GHCR namespaces must be lowercase; github.repository keeps display case.
+          IMAGE="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
           {
             echo "halogen=$HALOGEN"
             echo "sidecar=$N"
             echo "is_latest=$IS_LATEST"
+            echo "image=$IMAGE"
           } >> "$GITHUB_OUTPUT"
-          echo "Building sidecar for halogen $HALOGEN (build #$N, latest=$IS_LATEST)"
+          echo "Building sidecar for halogen $HALOGEN (build #$N, latest=$IS_LATEST) -> $IMAGE"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -90,8 +93,8 @@ jobs:
           build-args: |
             HALOGEN_IMAGE=ghcr.io/peonist-ai/halogen-flash-server:${{ steps.ver.outputs.halogen }}
           tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.halogen }}-sidecar${{ steps.ver.outputs.sidecar }}
-            ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.halogen }}
-            ${{ steps.ver.outputs.is_latest == 'yes' && format('ghcr.io/{0}:latest', github.repository) || '' }}
+            ghcr.io/${{ steps.ver.outputs.image }}:${{ steps.ver.outputs.halogen }}-sidecar${{ steps.ver.outputs.sidecar }}
+            ghcr.io/${{ steps.ver.outputs.image }}:${{ steps.ver.outputs.halogen }}
+            ${{ steps.ver.outputs.is_latest == 'yes' && format('ghcr.io/{0}:latest', steps.ver.outputs.image) || '' }}
           cache-from: type=gha,scope=image-${{ steps.ver.outputs.halogen }}
           cache-to: type=gha,scope=image-${{ steps.ver.outputs.halogen }},mode=max
