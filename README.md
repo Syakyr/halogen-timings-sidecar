@@ -2,6 +2,7 @@
 
 [![build](https://github.com/syakyr/halogen-timings-sidecar/actions/workflows/build.yml/badge.svg)](https://github.com/syakyr/halogen-timings-sidecar/actions/workflows/build.yml)
 [![watch-halogen](https://github.com/syakyr/halogen-timings-sidecar/actions/workflows/watch-halogen.yml/badge.svg)](https://github.com/syakyr/halogen-timings-sidecar/actions/workflows/watch-halogen.yml)
+![latest build](https://img.shields.io/github/v/tag/Syakyr/halogen-timings-sidecar?label=latest%20build&color=brightgreen)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)![uv](https://img.shields.io/badge/uv-managed-blueviolet)![tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)![coverage](https://img.shields.io/badge/coverage-proxy.py%2078%25-green)
 
 Drop-in front-end for [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) that forges a llama.cpp `timings` object onto the final SSE chunk so [llama-swap](https://github.com/mostlygeek/llama-swap) can show prefill and decode tok/s.
@@ -33,14 +34,24 @@ watcher checks upstream every 6 hours and builds automatically on each new Halog
 release — no manual build needed.
 
 ```bash
-# Newest sidecar for a given Halogen version (recommended, moves with rebuilds):
-docker pull ghcr.io/syakyr/halogen-timings-sidecar:0.11.1
+# Newest of everything (recommended — the watcher keeps this current):
+docker pull ghcr.io/syakyr/halogen-timings-sidecar:latest
+
+# Newest sidecar build for a specific Halogen version (moves on rebuild):
+docker pull ghcr.io/syakyr/halogen-timings-sidecar:<halogen>      # e.g. :0.11.2
 
 # Immutable, reproducible pin:
-docker pull ghcr.io/syakyr/halogen-timings-sidecar:0.11.1-sidecar1
+docker pull ghcr.io/syakyr/halogen-timings-sidecar:<halogen>-sidecar<N>
+```
 
-# Newest of everything:
-docker pull ghcr.io/syakyr/halogen-timings-sidecar:latest
+Check what's available without pulling:
+
+```bash
+curl -s "https://ghcr.io/token?scope=repository:syakyr/halogen-timings-sidecar:pull" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' \
+  | xargs -I{} curl -s -H "Authorization: Bearer {}" \
+      https://ghcr.io/v2/syakyr/halogen-timings-sidecar/tags/list \
+  | python3 -m json.tool
 ```
 
 Then run it exactly as you would the official image — same devices, same env,
@@ -52,7 +63,7 @@ podman run --rm -p 8731:8731 \
   --security-opt seccomp=unconfined --ipc=host --ulimit memlock=-1:-1 \
   -e HALOGEN_DOWNLOAD=peonist-ai/halogen-qwen3.8-flash-next \
   -v ~/halogen-models:/models \
-  ghcr.io/syakyr/halogen-timings-sidecar:0.11.1
+  ghcr.io/syakyr/halogen-timings-sidecar:latest
 ```
 
 ### Tag scheme
@@ -136,9 +147,10 @@ SSE upstream (forged timings, engine-log priority, non-stream passthrough,
 ### Releasing a sidecar change on top of a given Halogen version
 
 ```bash
-git tag 0.11.1-sidecar2 && git push origin 0.11.1-sidecar2
+git tag <halogen>-sidecar<N> && git push origin <halogen>-sidecar<N>
+# e.g. git tag 0.11.2-sidecar2 && git push origin 0.11.2-sidecar2
 # → build.yml runs lint/tests, then publishes
-#   :0.11.1-sidecar2 (immutable) and moves :0.11.1 to it
+#   :<halogen>-sidecarN (immutable) and moves :<halogen> to it
 ```
 
 `workflow_dispatch` on build.yml does the same interactively. The
