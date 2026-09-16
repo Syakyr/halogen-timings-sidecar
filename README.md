@@ -1,19 +1,38 @@
-# halogen-timings-sidecar
+<div align="center">
+
+# ⚡ Halogen Timings Sidecar
+
+### Real prefill / decode tok/s for Halogen — inside llama-swap.
+
+A drop-in front-end for [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server)
+that forges a llama.cpp-shaped `timings` object onto the final SSE chunk,
+so [llama-swap](https://github.com/mostlygeek/llama-swap) finally knows
+what your GPU has been doing.
 
 [![build](https://github.com/syakyr/halogen-timings-sidecar/actions/workflows/build.yml/badge.svg)](https://github.com/syakyr/halogen-timings-sidecar/actions/workflows/build.yml)
 [![watch-halogen](https://github.com/syakyr/halogen-timings-sidecar/actions/workflows/watch-halogen.yml/badge.svg)](https://github.com/syakyr/halogen-timings-sidecar/actions/workflows/watch-halogen.yml)
 ![latest build](https://img.shields.io/github/v/tag/Syakyr/halogen-timings-sidecar?label=latest%20build&color=brightgreen)
-![python](https://img.shields.io/badge/python-3.10%2B-blue)![uv](https://img.shields.io/badge/uv-managed-blueviolet)![tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)![coverage](https://img.shields.io/badge/coverage-proxy.py%2078%25-green)
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+![uv](https://img.shields.io/badge/uv-managed-blueviolet)
+![tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-proxy.py%2078%25-green)
 
-Drop-in front-end for [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) that forges a llama.cpp `timings` object onto the final SSE chunk so [llama-swap](https://github.com/mostlygeek/llama-swap) can show prefill and decode tok/s.
+**Pull · Run · Point llama-swap at `:8731` — done.**
 
-Halogen’s last chunk today:
+</div>
+
+---
+
+## The problem, in one chunk
+
+Halogen's final SSE chunk today carries no metrics:
 
 ```json
 {"choices":[{"finish_reason":"stop","delta":{}}]}
 ```
 
-After the sidecar:
+After the sidecar, it carries exactly what llama.cpp would have sent
+(llama-swap v141+ reads `timings.predicted_per_second`):
 
 ```json
 {"choices":[{"finish_reason":"stop","delta":{}}],
@@ -25,37 +44,9 @@ After the sidecar:
  }}
 ```
 
-Same shape llama.cpp emits. llama-swap v141+ reads `timings.predicted_per_second`.
+Every other byte of the stream passes through untouched.
 
-## Pull the prebuilt image (GHCR)
-
-Prebuilt images live at `ghcr.io/syakyr/halogen-timings-sidecar`. A GitHub Actions
-watcher checks upstream every 6 hours and builds automatically on each new Halogen
-release — no manual build needed.
-
-```bash
-# Newest of everything (recommended — the watcher keeps this current):
-docker pull ghcr.io/syakyr/halogen-timings-sidecar:latest
-
-# Newest sidecar build for a specific Halogen version (moves on rebuild):
-docker pull ghcr.io/syakyr/halogen-timings-sidecar:<halogen>      # e.g. :0.11.2
-
-# Immutable, reproducible pin:
-docker pull ghcr.io/syakyr/halogen-timings-sidecar:<halogen>-sidecar<N>
-```
-
-Check what's available without pulling:
-
-```bash
-curl -s "https://ghcr.io/token?scope=repository:syakyr/halogen-timings-sidecar:pull" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' \
-  | xargs -I{} curl -s -H "Authorization: Bearer {}" \
-      https://ghcr.io/v2/syakyr/halogen-timings-sidecar/tags/list \
-  | python3 -m json.tool
-```
-
-Then run it exactly as you would the official image — same devices, same env,
-same published port 8731:
+## Quick start
 
 ```bash
 podman run --rm -p 8731:8731 \
@@ -66,56 +57,17 @@ podman run --rm -p 8731:8731 \
   ghcr.io/syakyr/halogen-timings-sidecar:latest
 ```
 
-### Tag scheme
+Point llama-swap at `http://127.0.0.1:8731`. Same devices, same env,
+same port as the official image — the only change is the image name.
 
-| Tag | Meaning |
-|---|---|
-| `<halogen>` | latest sidecar build for that Halogen version (moves on rebuild) |
-| `<halogen>-sidecar<N>` | immutable build N for that Halogen version |
-| `latest` | newest Halogen version with a built sidecar |
+> **Set a long `healthCheckTimeout` (10–20 min).** The sidecar binds `:8731`
+> instantly, but Halogen's API only appears on loopback `:18731` after the
+> engine finishes reading weights. During that window the sidecar answers
+> `503` with `Retry-After: 5` — that wait is expected, not a broken proxy.
+>
+> `engine` / `bench` / `sweep` modes bypass the sidecar entirely.
 
-## Build locally (one-container, same `podman run` you already use)
-
-```bash
-cd halogen-timings-sidecar
-podman build -t halogen-flash-timed:local .
-
-podman run --rm -p 8731:8731 \
-  --device /dev/kfd --device /dev/dri --group-add keep-groups \
-  --security-opt seccomp=unconfined --ipc=host --ulimit memlock=-1:-1 \
-  -e HALOGEN_DOWNLOAD=peonist-ai/halogen-qwen3.8-flash-next \
-  -v ~/halogen-models:/models \
-  halogen-flash-timed:local
-```
-
-Point llama-swap at `http://127.0.0.1:8731`. No config change other than the image name.
-
-Give llama-swap a long `healthCheckTimeout` (10–20 minutes). The sidecar binds `:8731` immediately, but Halogen’s API only appears on loopback `:18731` after the engine finishes reading weights. During that window the sidecar answers `503` with `Retry-After: 5`. A flood of `ConnectionRefusedError: 127.0.0.1:18731` on older builds was that wait, not a broken proxy.
-
-`engine` / `bench` / `sweep` still bypass the sidecar (those modes are not what llama-swap talks to).
-
-## Two-container official compose + sidecar
-
-Keeps the 115 GiB engine process untouched when you iterate on the proxy:
-
-```bash
-HALOGEN_MODELS=~/halogen-models docker compose up --build
-```
-
-## What is measured
-
-| Field | Source |
-|---|---|
-| `prompt_ms` | request start → first non-empty `delta.content` / `reasoning_content` (TTFT) |
-| `predicted_ms` | first content → `finish_reason` chunk |
-| `prompt_n` / `predicted_n` | upstream `usage` if present, else a cheap CJK/latin estimate |
-| `cache_n` | longest previously seen message prefix, else “too fast to be prefill” vs `HALOGEN_PREFILL_CEILING` (default 1800 tok/s) |
-
-This is HTTP-visible wall time, not Halogen’s internal GEMM clocks. Prefill tok/s will sit a few percent under `sweep`. Decode tok/s is close. `cache_n` is inferred — Halogen does not send it. Prefix memory needs the sidecar process to have seen the earlier turn (same container). The rate ceiling still fires on a cache hit even if the prefix table missed (restart, rewritten history). Override the ceiling with `-e HALOGEN_PREFILL_CEILING=1500` if a cold prefill is being marked cached.
-
-Non-stream responses are passed through unchanged. llama-swap would otherwise attribute the whole wait to decode.
-
-## Check
+Verify it's working:
 
 ```bash
 curl -Ns http://127.0.0.1:8731/v1/chat/completions \
@@ -125,7 +77,73 @@ curl -Ns http://127.0.0.1:8731/v1/chat/completions \
   | tail -n 4
 ```
 
-The `finish_reason` object should contain `timings.predicted_per_second`. The next line should still be `data: [DONE]`.
+The `finish_reason` object should carry `timings.predicted_per_second`,
+and the stream should still end with `data: [DONE]`.
+
+## Images & tags
+
+Prebuilt images: `ghcr.io/syakyr/halogen-timings-sidecar`. A GitHub Actions
+watcher checks upstream every 6 hours and builds automatically on each new
+Halogen release — no manual build needed, ever.
+
+| Tag | Meaning |
+|---|---|
+| `latest` | newest Halogen version with a built sidecar |
+| `<halogen>` | latest sidecar build for that Halogen version (moves on rebuild) |
+| `<halogen>-sidecar<N>` | immutable build N — pin this for reproducibility |
+
+<details>
+<summary>List available tags without pulling</summary>
+
+```bash
+curl -s "https://ghcr.io/token?scope=repository:syakyr/halogen-timings-sidecar:pull" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' \
+  | xargs -I{} curl -s -H "Authorization: Bearer {}" \
+      https://ghcr.io/v2/syakyr/halogen-timings-sidecar/tags/list \
+  | python3 -m json.tool
+```
+
+</details>
+
+## What is measured
+
+| Field | Source |
+|---|---|
+| `prompt_ms` | request start → first non-empty `delta.content` / `reasoning_content` (TTFT) |
+| `predicted_ms` | first content → `finish_reason` chunk |
+| `prompt_n` / `predicted_n` | tee'd `serve_api` log line if present, else upstream `usage`, else a cheap CJK/latin estimate |
+| `cache_n` | `serve_api` log, else longest previously seen message prefix, else "too fast to be prefill" vs `HALOGEN_PREFILL_CEILING` (default 1800 tok/s) |
+
+This is HTTP-visible wall time, not Halogen's internal GEMM clocks.
+Prefill tok/s sits a few percent under `sweep`; decode tok/s is close.
+`cache_n` is inferred — Halogen does not send it. Prefix memory needs the
+sidecar process to have seen the earlier turn (same container); the rate
+ceiling still fires on a cache hit even if the prefix table missed
+(restart, rewritten history). If a cold prefill is being marked cached,
+override with `-e HALOGEN_PREFILL_CEILING=1500`.
+
+Non-stream responses pass through unchanged — inventing a single-bucket
+rate would silently attribute prefill to decode.
+
+## Two-container topology (optional)
+
+Keeps the 115 GiB engine process untouched when you iterate on the proxy:
+
+```bash
+HALOGEN_MODELS=~/halogen-models docker compose up --build
+```
+
+The `sidecar` service runs the same wrapped image in standalone-proxy mode
+(`HALOGEN_SIDECAR_UPSTREAM=api:8731`); llama-swap targets `:8731` as always.
+
+## Build locally
+
+```bash
+podman build -t halogen-flash-timed:local \
+  --build-arg HALOGEN_IMAGE=ghcr.io/peonist-ai/halogen-flash-server:0.11.2 .
+```
+
+Then `podman run` it exactly as in the Quick start, swapping the image name.
 
 ## Development (uv-first)
 
@@ -133,18 +151,18 @@ All dev tooling (pytest, pytest-cov, ruff) is pinned in `pyproject.toml` /
 `uv.lock`; the proxy itself is stdlib-only.
 
 ```bash
-uv sync                      # create .venv with dev tools
-uv run ruff check .          # lint
-uv run ruff format .         # format
+uv sync                                            # create .venv with dev tools
+uv run ruff check .                                # lint
+uv run ruff format .                               # format
 uv run pytest --cov=proxy --cov-branch --cov-fail-under=75
 ```
 
-Tests need no GPU: `tests/test_unit.py` covers the pure timing/estimation
-functions, and `tests/test_smoke.py` runs the Sidecar against a mock Halogen
-SSE upstream (forged timings, engine-log priority, non-stream passthrough,
-503-during-cold-load, CLI boot).
+No GPU required: `tests/test_unit.py` covers the pure timing/estimation
+functions, and `tests/test_smoke.py` runs the Sidecar against a mock
+Halogen SSE upstream (forged timings, engine-log priority, non-stream
+passthrough, 503-during-cold-load, CLI boot).
 
-### Releasing a sidecar change on top of a given Halogen version
+### Releasing a sidecar change
 
 ```bash
 git tag <halogen>-sidecar<N> && git push origin <halogen>-sidecar<N>
@@ -153,5 +171,5 @@ git tag <halogen>-sidecar<N> && git push origin <halogen>-sidecar<N>
 #   :<halogen>-sidecarN (immutable) and moves :<halogen> to it
 ```
 
-`workflow_dispatch` on build.yml does the same interactively. The
-watch-halogen workflow only ever creates `sidecar1` tags automatically.
+`workflow_dispatch` on `build.yml` does the same interactively. The
+`watch-halogen` workflow only ever creates `sidecar1` tags automatically.
