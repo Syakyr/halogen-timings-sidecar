@@ -52,7 +52,6 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       INPUT_VERSION: ${{ inputs.halogen_version }}
       INPUT_SIDECAR: ${{ inputs.sidecar_number }}
-      EVENT_NAME: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -103,23 +102,66 @@ jobs:
           echo "sidecar=${N}" >> "$GITHUB_OUTPUT"
           echo "tag=${VERSION}-sidecar${N}" >> "$GITHUB_OUTPUT"
 
-      - name: Push provenance tag
+      - name: Check tag and image state
+        id: state
         run: |
           set -euo pipefail
           TAG="${{ steps.ver.outputs.tag }}"
+
           if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
-            if [ "$EVENT_NAME" = "schedule" ]; then
-              echo "${TAG} already exists and nothing new upstream; done"
-              exit 0
-            fi
-            echo "${TAG} already exists; re-dispatching the build"
+            tag_exists=yes
           else
-            git tag "$TAG"
-            git push origin "$TAG"
-            echo "pushed ${TAG}"
+            tag_exists=no
           fi
 
+          # A git tag is not proof of a build. Probe GHCR for the exact
+          # immutable tag so a version that was tagged but never built (or
+          # whose build failed) gets rebuilt on the next tick instead of being
+          # silently skipped forever. Anonymous pull token is enough here.
+          IMAGE="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          PULL_TOKEN="$(
+            curl -sS --retry 3 --retry-all-errors \
+              "https://ghcr.io/token?scope=repository:${IMAGE}:pull" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin).get("token", ""))'
+          )"
+          if [ -z "$PULL_TOKEN" ]; then
+            echo "::error::could not obtain an anonymous GHCR pull token"
+            exit 1
+          fi
+          code="$(
+            curl -sS --retry 3 --retry-all-errors -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${PULL_TOKEN}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/${IMAGE}/manifests/${TAG}"
+          )"
+          case "$code" in
+            200) image_exists=yes ;;
+            404) image_exists=no ;;
+            *)
+              echo "::error::GHCR manifest probe returned HTTP ${code}; refusing to guess"
+              exit 1
+              ;;
+          esac
+
+          echo "tag_exists=${tag_exists}" >> "$GITHUB_OUTPUT"
+          echo "image_exists=${image_exists}" >> "$GITHUB_OUTPUT"
+          echo "${TAG}: git tag=${tag_exists}, ghcr image=${image_exists}"
+
+      - name: Push provenance tag
+        if: steps.state.outputs.tag_exists == 'no'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "pushed ${TAG}"
+
+      # Skip only when a scheduled run finds the tag AND its image already
+      # published. A manual run always rebuilds: asking for it is the intent.
       - name: Trigger build.yml
+        if: >
+          github.event_name != 'schedule' ||
+          steps.state.outputs.image_exists == 'no'
         run: |
           set -euo pipefail
           body="$(mktemp)"
@@ -138,3 +180,9 @@ jobs:
             exit 1
           fi
           echo "dispatched build.yml for halogen ${{ steps.ver.outputs.version }} (sidecar ${{ steps.ver.outputs.sidecar }})"
+
+      - name: Nothing to do
+        if: >
+          github.event_name == 'schedule' &&
+          steps.state.outputs.image_exists == 'yes'
+        run: echo "${{ steps.ver.outputs.tag }} is already built; nothing to do"
