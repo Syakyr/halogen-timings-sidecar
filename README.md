@@ -86,6 +86,12 @@ Prebuilt images: `ghcr.io/syakyr/halogen-timings-sidecar`. A GitHub Actions
 watcher checks upstream every 6 hours and builds automatically on each new
 Halogen release — no manual build needed, ever.
 
+The watcher also keeps this repo's own default base pins (`Dockerfile` ARG
+and `compose.yml` defaults) in sync with the newest upstream release via a
+`chore: pin default base` commit, so bare local builds never drift onto an
+old base. Manual runs pinned to an older `halogen_version` skip the sync —
+defaults track newest-only.
+
 <details>
 <summary>Don't want to wait up to 6 hours for a fresh upstream tag?</summary>
 
@@ -159,7 +165,7 @@ The `sidecar` service runs the same wrapped image in standalone-proxy mode
 
 ```bash
 podman build -t halogen-flash-timed:local \
-  --build-arg HALOGEN_IMAGE=ghcr.io/peonist-ai/halogen-flash-server:0.11.2 .
+  --build-arg HALOGEN_IMAGE=ghcr.io/peonist-ai/halogen-flash-server:0.11.4 .
 ```
 
 Then `podman run` it exactly as in the Quick start, swapping the image name.

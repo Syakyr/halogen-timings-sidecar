@@ -23,6 +23,13 @@ name: watch-halogen
 # Halogen ships several releases per day; every 6 hours keeps lag low without
 # wasting runs. For an immediate build of a specific upstream version, run this
 # workflow manually and fill in the inputs (or run build.yml directly).
+#
+# The watcher also keeps the Dockerfile/compose.yml default base pins fresh:
+# after resolving the newest upstream version it commits a
+# "chore: pin default base" bump to main (skipped when a manual run pinned
+# an older halogen_version, so the defaults keep tracking newest-only).
+# A push to main never triggers build.yml (that only fires on tag pushes
+# and PRs), so the chore commit is inert beyond updating the defaults.
 
 on:
   schedule:
@@ -180,6 +187,27 @@ jobs:
             exit 1
           fi
           echo "dispatched build.yml for halogen ${{ steps.ver.outputs.version }} (sidecar ${{ steps.ver.outputs.sidecar }})"
+
+      # Keep the Dockerfile ARG / compose defaults in sync with the newest
+      # upstream base so bare local builds don't rot. Only on newest-only
+      # resolutions: a manual run pinned to an older halogen_version must
+      # not drag the defaults backwards. Halogen image tags are the bare
+      # version (no -b<build> suffix), so the resolved version IS the tag.
+      - name: Sync pinned defaults
+        if: env.INPUT_VERSION == ''
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.ver.outputs.version }}"
+          sed -i -E "s|(ghcr\.io/peonist-ai/halogen-flash-server:)[0-9]+\.[0-9]+\.[0-9]+|\1${BASE}|g" Dockerfile compose.yml
+          if git diff --quiet; then
+            echo "defaults already at ${BASE}; nothing to sync"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "chore: pin default base to ${BASE}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            echo "synced Dockerfile + compose.yml defaults to ${BASE}"
+          fi
 
       - name: Nothing to do
         if: >
