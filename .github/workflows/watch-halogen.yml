@@ -1,39 +1,140 @@
 name: watch-halogen
 
 # Watches peonist-ai/halogen-flash-server for new releases and auto-tags
-# <version>-sidecar1, which triggers build.yml. Halogen ships several
-# releases per day; every 6 hours keeps lag low without wasting runs.
+# <version>-sidecar<N>, which is the provenance record; the image itself is
+# built by an explicit workflow_dispatch into build.yml.
+#
+# Two things this file has to work around, both verified against GitHub docs and
+# this repo's own run history:
+#
+#  1. api.github.com must be called AUTHENTICATED. An unauthenticated curl from
+#     a GitHub-hosted runner shares one tiny anonymous quota with every other
+#     runner on that egress range and routinely returns 403. GITHUB_TOKEN gives
+#     a per-run 5000/hr budget, and reading a *public* repo's tags needs no
+#     extra permission beyond the default token.
+#
+#  2. A tag pushed with GITHUB_TOKEN does NOT trigger build.yml. Docs: "With
+#     the exception of workflow_dispatch and repository_dispatch, other
+#     GITHUB_TOKEN-triggered events do not create workflow runs at all."
+#     So the tag push alone silently produced no image (0.11.3-sidecar1 was
+#     tagged and never built). workflow_dispatch is the exception, so we call it
+#     directly instead of relying on the tag push.
+#
+# Halogen ships several releases per day; every 6 hours keeps lag low without
+# wasting runs. For an immediate build of a specific upstream version, run this
+# workflow manually and fill in the inputs (or run build.yml directly).
 
 on:
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
+    inputs:
+      halogen_version:
+        description: "Upstream halogen version (blank = newest upstream tag)"
+        required: false
+        default: ""
+      sidecar_number:
+        description: "Sidecar build number for that Halogen version"
+        required: false
+        default: "1"
 
 permissions:
-  contents: write
+  contents: write # push the provenance tag
+  actions: write # POST workflow_dispatch to build.yml
+
+env:
+  UPSTREAM: peonist-ai/halogen-flash-server
 
 jobs:
   tag-new-upstream:
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_VERSION: ${{ inputs.halogen_version }}
+      INPUT_SIDECAR: ${{ inputs.sidecar_number }}
+      EVENT_NAME: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Tag newest upstream release if not yet built
+      - name: Resolve upstream halogen version
+        id: ver
         run: |
           set -euo pipefail
-          LATEST="$(
-            curl -fsSL \
-              https://api.github.com/repos/peonist-ai/halogen-flash-server/tags \
-              | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["name"].lstrip("v"))'
-          )"
-          TAG="${LATEST}-sidecar1"
-          echo "newest upstream halogen: ${LATEST}"
-          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
-            echo "${TAG} already exists; nothing to do"
-            exit 0
+
+          VERSION="${INPUT_VERSION:-}"
+          if [ -n "$VERSION" ]; then
+            echo "using manually requested halogen version ${VERSION}"
+          else
+            body="$(mktemp)"
+            code="$(
+              curl -sS --retry 3 --retry-all-errors \
+                -o "$body" -w '%{http_code}' \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${UPSTREAM}/tags?per_page=100"
+            )"
+            if [ "$code" != "200" ]; then
+              echo "::error::upstream tag list returned HTTP ${code}"
+              head -c 800 "$body" || true
+              exit 1
+            fi
+            # /tags order is not documented as semver-descending, so sort here
+            # rather than trusting index 0 (lexicographic order breaks at 0.9 -> 0.10).
+            VERSION="$(
+              python3 -c '
+          import json, re, sys
+          with open(sys.argv[1]) as fh:
+              tags = json.load(fh)
+          versions = [t["name"].lstrip("v") for t in tags
+                      if re.fullmatch(r"v?\d+\.\d+\.\d+", t["name"])]
+          if not versions:
+              sys.exit("no plain semver tags found upstream")
+          key = lambda v: [int(p) for p in v.split(".")]
+          print(max(versions, key=key))
+          ' "$body"
+            )"
+            echo "newest upstream halogen: ${VERSION}"
           fi
-          git tag "$TAG"
-          git push origin "$TAG"
-          echo "pushed ${TAG}; build.yml will publish the image"
+
+          N="${INPUT_SIDECAR:-1}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sidecar=${N}" >> "$GITHUB_OUTPUT"
+          echo "tag=${VERSION}-sidecar${N}" >> "$GITHUB_OUTPUT"
+
+      - name: Push provenance tag
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            if [ "$EVENT_NAME" = "schedule" ]; then
+              echo "${TAG} already exists and nothing new upstream; done"
+              exit 0
+            fi
+            echo "${TAG} already exists; re-dispatching the build"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "pushed ${TAG}"
+          fi
+
+      - name: Trigger build.yml
+        run: |
+          set -euo pipefail
+          body="$(mktemp)"
+          code="$(
+            curl -sS --retry 3 --retry-all-errors \
+              -o "$body" -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
+              -d "{\"ref\":\"${{ github.ref }}\",\"inputs\":{\"halogen_version\":\"${{ steps.ver.outputs.version }}\",\"sidecar_number\":\"${{ steps.ver.outputs.sidecar }}\"}}"
+          )"
+          if [ "$code" != "204" ]; then
+            echo "::error::workflow_dispatch returned HTTP ${code}"
+            head -c 800 "$body" || true
+            exit 1
+          fi
+          echo "dispatched build.yml for halogen ${{ steps.ver.outputs.version }} (sidecar ${{ steps.ver.outputs.sidecar }})"

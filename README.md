@@ -86,6 +86,25 @@ Prebuilt images: `ghcr.io/syakyr/halogen-timings-sidecar`. A GitHub Actions
 watcher checks upstream every 6 hours and builds automatically on each new
 Halogen release — no manual build needed, ever.
 
+<details>
+<summary>Don't want to wait up to 6 hours for a fresh upstream tag?</summary>
+
+Run **watch-halogen** manually (`Actions → watch-halogen → Run workflow`) and
+leave `halogen_version` blank to build the newest upstream release now, or pin
+an exact one. The same workflow also runs on schedule.
+
+```bash
+# same thing from the CLI
+gh workflow run watch-halogen.yml -f halogen_version=0.11.3 -f sidecar_number=1
+```
+
+Note that the watcher triggers `build.yml` with an explicit `workflow_dispatch`
+rather than relying on its own tag push: a tag pushed with `GITHUB_TOKEN` does
+not start other workflows (only `workflow_dispatch`/`repository_dispatch`
+cross that boundary), so the tag is kept purely as provenance.
+
+</details>
+
 | Tag | Meaning |
 |---|---|
 | `latest` | newest Halogen version with a built sidecar |
