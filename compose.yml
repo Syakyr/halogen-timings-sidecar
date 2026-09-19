@@ -18,7 +18,7 @@ x-halogen-devices: &halogen-devices
 
 services:
   engine:
-    image: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.9}
+    image: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.10}
     command: ["engine"]
     environment:
       HALOGEN_BIND: 0.0.0.0
@@ -28,7 +28,7 @@ services:
     <<: *halogen-devices
 
   api:
-    image: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.9}
+    image: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.10}
     command: ["api"]
     depends_on: [engine]
     environment:
@@ -41,7 +41,7 @@ services:
     build:
       context: .
       args:
-        HALOGEN_IMAGE: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.9}
+        HALOGEN_IMAGE: ${HALOGEN_IMAGE:-ghcr.io/peonist-ai/halogen-flash-server:0.11.10}
     environment:
       HALOGEN_SIDECAR_UPSTREAM: api:8731
       HALOGEN_SIDECAR_LISTEN: 0.0.0.0:8731
