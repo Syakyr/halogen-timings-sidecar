@@ -170,7 +170,7 @@ class PrefixMemory:
             hit = self._get(prompt_fingerprint(model, prompt))
             if hit is not None:
                 best = max(best, hit)
-        return min(best, max(0, total_prompt - 1))
+        return max(0, min(best, total_prompt))
 
     def remember(
         self, req: dict, prompt_tokens: int, completion_tokens: int, gen_text: str
@@ -201,10 +201,19 @@ PREFILL_CEILING = float(os.environ.get("HALOGEN_PREFILL_CEILING", "1800"))
 UPSTREAM_LOG = os.environ.get("HALOGEN_UPSTREAM_LOG", "/tmp/halogen-upstream.log")
 
 # serve_api: mtp 250 tok in 6.75s = 37.05 t/s | 153 rounds, commit 1.63/round | prompt 1287 (1035 cached), prefill 1.26s | detok 31us/tok
+# Halogen grew this line over releases: the cached paren gained a percentage
+# ("(185594 cached, 99.8%)") and prefill gained a "(378 new)" suffix. The
+# strict form stopped matching, which silently pushed *every* request onto
+# the estimate path while the engine's real numbers sat unread in the log.
+# Both additions are optional, so the bare form ("prompt 500, prefill 2.0s")
+# still parses.
 SERVE_API_RE = re.compile(
     r"serve_api:\s+(\S+)\s+(\d+)\s+tok\s+in\s+([\d.]+)s\s+=\s+([\d.]+)\s+t/s"
     r"(?:\s+\|\s+(\d+)\s+rounds,\s+commit\s+([\d.]+)/round)?"
-    r".*?\|\s+prompt\s+(\d+)(?:\s+\((\d+)\s+cached\))?\s*,\s*prefill\s+([\d.]+)s"
+    r".*?\|\s+prompt\s+(\d+)"
+    r"(?:\s*\(\s*(\d+)\s+cached[^()]*\))?"
+    r"\s*,\s*prefill\s+([\d.]+)s"
+    r"(?:\s*\(\s*(\d+)\s+new\s*\))?"
 )
 
 
@@ -221,7 +230,12 @@ def parse_serve_api_line(line: str) -> dict | None:
     prompt_total = int(m.group(7))
     cached = int(m.group(8) or 0)
     prefill_s = float(m.group(9))
-    prompt_n = max(0, prompt_total - cached)
+    # Prefer the engine's explicit "(N new)" count when the line carries it;
+    # fall back to total-minus-cached for older log formats.
+    new_tokens = m.group(10)
+    prompt_n = (
+        int(new_tokens) if new_tokens is not None else max(0, prompt_total - cached)
+    )
     # Each MTP round always emits one target-model token. Everything above
     # `rounds` is accepted draft. commit 2.04/round means the head proposed
     # at least two extras that round, so draft_n is rounds × that width,
@@ -344,9 +358,7 @@ def split_cached_prompt(
 ) -> tuple[int, int]:
     """Return (cache_n, prompt_n) with prompt_n = tokens actually prefills."""
     total_prompt = max(0, int(total_prompt))
-    cache_n = (
-        min(max(0, int(cache_hint)), max(0, total_prompt - 1)) if total_prompt else 0
-    )
+    cache_n = max(0, min(int(cache_hint), total_prompt)) if total_prompt else 0
     prompt_n = max(0, total_prompt - cache_n)
     if prompt_ms > 150.0 and prompt_n > 64:
         implied = prompt_n / (prompt_ms / 1000.0)
@@ -355,10 +367,10 @@ def split_cached_prompt(
             processed = min(processed, prompt_n)
             cache_n = total_prompt - processed
             prompt_n = processed
-    if total_prompt and prompt_n <= 0:
-        prompt_n = 1
-        cache_n = total_prompt - 1
-    return cache_n, prompt_n
+    # A full hit really does mean zero fresh prefill. The old prompt_n=1
+    # floor charged the entire TTFT to a single token, which is where
+    # "prompt=1.4 tok/s" on a 185k warm prompt came from.
+    return max(0, cache_n), prompt_n
 
 
 def cached_tokens_from_usage(usage: dict | None) -> int:
@@ -782,10 +794,45 @@ class Sidecar:
         seen_usage: dict | None = None
         prompt_n_est = estimate_prompt_tokens(req)
         buf = b""
+        # Halogen emits more than one metrics-bearing chunk per turn (the
+        # finish_reason chunk, then a usage chunk). The gap between them is
+        # this coroutine's own ServeApiLog.take() wait, not decode, so the
+        # decode window is frozen at the first trigger and the engine row is
+        # looked up once. Without this the second pass reported decode ~2x
+        # low (0.85s of sidecar stall charged to the model).
+        decode_end: float | None = None
+        engine: dict | None = None
+        pending: dict | None = None
 
         async def emit(blob: bytes) -> None:
             dst.write(blob)
             await dst.drain()
+
+        def flush_log() -> None:
+            """One line per request, for the numbers actually delivered."""
+            if not pending:
+                return
+            t = pending["timings"]
+            draft_n = t.get("draft_n") or 0
+            accepted = t.get("draft_n_accepted") or 0
+            accept = (accepted / draft_n) if draft_n else 0.0
+            log.info(
+                "timings [%s] cache_n=%s prompt_n=%s prompt=%.1f tok/s "
+                "predicted_n=%s decode=%.1f tok/s ttft=%.3fs"
+                "%s",
+                pending["source"],
+                t["cache_n"],
+                t["prompt_n"],
+                t["prompt_per_second"],
+                t["predicted_n"],
+                t["predicted_per_second"],
+                pending["ttft_s"],
+                (
+                    f" draft_n={draft_n} accepted={accepted} accept={accept:.2f}"
+                    if draft_n
+                    else ""
+                ),
+            )
 
         while True:
             chunk = await src.read(64 * 1024)
@@ -813,6 +860,7 @@ class Sidecar:
                     if buf:
                         await emit(buf)
                         buf = b""
+                    flush_log()
                     return
 
                 try:
@@ -846,6 +894,8 @@ class Sidecar:
                     continue
 
                 t_end = time.perf_counter()
+                if decode_end is None:
+                    decode_end = t_end
                 if seen_usage:
                     total_prompt = int(
                         seen_usage.get("prompt_tokens")
@@ -863,9 +913,10 @@ class Sidecar:
 
                 predicted_n = max(predicted_n, 0)
                 ttft_s = (t_first - t0) if t_first is not None else (t_end - t0)
-                engine = await self.api_log.take(
-                    ttft_s, predicted_n, started_mono=started_mono
-                )
+                if engine is None:
+                    engine = await self.api_log.take(
+                        ttft_s, predicted_n, started_mono=started_mono
+                    )
 
                 if engine:
                     cache_n = engine["cache_n"]
@@ -909,7 +960,7 @@ class Sidecar:
                     timings = build_timings(
                         t0=t0,
                         t_first=t_first,
-                        t_end=t_end,
+                        t_end=decode_end if decode_end is not None else t_end,
                         prompt_n=prompt_n,
                         predicted_n=predicted_n,
                         cache_n=cache_n,
@@ -930,26 +981,9 @@ class Sidecar:
                     obj, ensure_ascii=False, separators=(",", ":")
                 )
                 await emit(new_line.encode("utf-8") + b"\n")
-                draft_n = timings.get("draft_n") or 0
-                accepted = timings.get("draft_n_accepted") or 0
-                accept = (accepted / draft_n) if draft_n else 0.0
-                log.info(
-                    "timings [%s] cache_n=%s prompt_n=%s prompt=%.1f tok/s "
-                    "predicted_n=%s decode=%.1f tok/s ttft=%.3fs"
-                    "%s",
-                    source,
-                    timings["cache_n"],
-                    timings["prompt_n"],
-                    timings["prompt_per_second"],
-                    timings["predicted_n"],
-                    timings["predicted_per_second"],
-                    ttft_s,
-                    (
-                        f" draft_n={draft_n} accepted={accepted} accept={accept:.2f}"
-                        if draft_n
-                        else ""
-                    ),
-                )
+                pending = {"source": source, "timings": timings, "ttft_s": ttft_s}
+
+        flush_log()
 
 
 async def main() -> None:

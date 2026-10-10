@@ -11,6 +11,7 @@ plumbing; one subprocess test covers the CLI entrypoint.
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import sys
@@ -38,6 +39,46 @@ SERVE_API_MTP = (
     "| prompt 1287 (1035 cached), prefill 1.26s"
 )
 
+# What halogen-flash-server >= 0.17 actually prints: the cached paren grew a
+# percentage and prefill grew an explicit "(N new)". The strict parser stopped
+# matching this, so every request silently degraded to [estimate].
+SERVE_API_MTP_NEW = (
+    "serve_api: mtp 57 tok in 0.90s = 63.42 t/s | 17 rounds, commit 3.29/round "
+    "| prompt 185972 (185594 cached, 99.8%), prefill 0.66s (378 new) "
+    "| detok 12us/tok | pld 10 rounds, 2.60 acc/round "
+    "| pool 494592/524288 94% | think on"
+)
+
+# Halogen's real stream tail: a bare finish_reason chunk, then a *separate*
+# usage chunk. Both are metrics-bearing, which used to make every request log
+# twice and left the second line's decode window holding the sidecar's own
+# engine-log wait.
+TWO_TRIGGER_EVENTS = MOCK_EVENTS + [
+    {"choices": [{"finish_reason": "stop", "delta": {}}]},
+    {
+        "choices": [{"finish_reason": "stop", "delta": {}}],
+        "usage": {
+            "prompt_tokens": 1287,
+            "completion_tokens": 250,
+            "total_tokens": 1537,
+        },
+    },
+]
+
+
+class LogCapture(logging.Handler):
+    """Collect proxy.py's own log lines so 'logged once' is assertable."""
+
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+    def timing_lines(self):
+        return [ln for ln in self.lines if "timings [" in ln]
+
 
 def free_port() -> int:
     s = socket.socket()
@@ -47,57 +88,70 @@ def free_port() -> int:
     return port
 
 
-async def mock_upstream(reader, writer):
-    headers = {}
-    while True:
-        line = await reader.readline()
-        if not line or line in (b"\r\n", b"\n"):
-            break
-        key, _, value = line.decode("latin1").partition(":")
-        headers[key.strip().lower()] = value.strip()
-    body = b""
-    if headers.get("content-length"):
-        body = await reader.readexactly(int(headers["content-length"]))
-    try:
-        req = json.loads(body)
-    except Exception:
-        req = {}
+def make_mock_upstream(events, gap=0.03):
+    """Build a stub Halogen SSE server for the given events.
 
-    if not req.get("stream"):
-        resp = json.dumps(
-            {
-                "choices": [
-                    {
-                        "message": {"role": "assistant", "content": "hi"},
-                        "finish_reason": "stop",
-                    }
-                ]
-            }
-        ).encode()
+    `gap` is the pause between chunks; tests widen the gap after a
+    metrics-bearing chunk to simulate the sidecar's own engine-log wait.
+    """
+
+    async def handler(reader, writer):
+        headers = {}
+        while True:
+            line = await reader.readline()
+            if not line or line in (b"\r\n", b"\n"):
+                break
+            key, _, value = line.decode("latin1").partition(":")
+            headers[key.strip().lower()] = value.strip()
+        body = b""
+        if headers.get("content-length"):
+            body = await reader.readexactly(int(headers["content-length"]))
+        try:
+            req = json.loads(body)
+        except Exception:
+            req = {}
+
+        if not req.get("stream"):
+            resp = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "hi"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(resp) + resp
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
+
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: application/json\r\n"
-            b"Content-Length: %d\r\n\r\n" % len(resp) + resp
+            b"Content-Type: text/event-stream\r\n"
+            b"Cache-Control: no-cache\r\n\r\n"
         )
+        await writer.drain()
+        for event in events:
+            writer.write(f"data: {json.dumps(event)}\n\n".encode())
+            await writer.drain()
+            await asyncio.sleep(gap)
+        writer.write(b"data: [DONE]\n\n")
         await writer.drain()
         writer.close()
         await writer.wait_closed()
-        return
 
-    writer.write(
-        b"HTTP/1.1 200 OK\r\n"
-        b"Content-Type: text/event-stream\r\n"
-        b"Cache-Control: no-cache\r\n\r\n"
-    )
-    await writer.drain()
-    for event in MOCK_EVENTS:
-        writer.write(f"data: {json.dumps(event)}\n\n".encode())
-        await writer.drain()
-        await asyncio.sleep(0.03)
-    writer.write(b"data: [DONE]\n\n")
-    await writer.drain()
-    writer.close()
-    await writer.wait_closed()
+    return handler
+
+
+async def mock_upstream(reader, writer):
+    await make_mock_upstream(MOCK_EVENTS)(reader, writer)
 
 
 async def post_chat(port: int, stream: bool = True):
@@ -302,3 +356,96 @@ def test_non_stream_passthrough_untimed():
 
 def test_cli_boots_and_serves():
     asyncio.run(scenario_cli_subprocess())
+
+
+async def scenario_new_log_format_single_line():
+    """The >=0.17 serve_api line must drive the engine path, logged once."""
+    import tempfile
+
+    fd, logpath = tempfile.mkstemp(prefix="halogen-upstream-test-")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(SERVE_API_MTP_NEW + "\n")
+    mock = await asyncio.start_server(
+        make_mock_upstream(TWO_TRIGGER_EVENTS), "127.0.0.1", 0
+    )
+    mock_port = mock.sockets[0].getsockname()[1]
+    sidecar, server, proxy_port = await start_sidecar_proxy(mock_port)
+    sidecar.api_log = proxy_mod.ServeApiLog(logpath)
+    cap = LogCapture()
+    proxy_mod.log.addHandler(cap)
+    old_level = proxy_mod.log.level
+    proxy_mod.log.setLevel(logging.INFO)
+    try:
+        status, _, _, payloads = await post_chat(proxy_port)
+        assert status == 200
+        lines = cap.timing_lines()
+        assert len(lines) == 1, f"expected exactly one timings line, got {lines}"
+        assert "[serve_api]" in lines[0], lines[0]
+
+        first_trigger = json.loads(payloads[-3])
+        last_trigger = json.loads(payloads[-2])
+        assert first_trigger["choices"][0]["finish_reason"] == "stop"
+        # Both metrics-bearing chunks carry the engine's numbers, not a
+        # re-measured window.
+        for timings in (first_trigger["timings"], last_trigger["timings"]):
+            assert timings["cache_n"] == 185594
+            assert timings["prompt_n"] == 378
+            assert timings["prompt_ms"] == 660.0
+            assert timings["predicted_n"] == 57
+            assert timings["predicted_ms"] == 900.0
+            assert timings["predicted_per_second"] == 63.42
+        assert last_trigger["usage"]["prompt_tokens"] == 185972
+    finally:
+        proxy_mod.log.setLevel(old_level)
+        proxy_mod.log.removeHandler(cap)
+        server.close()
+        await server.wait_closed()
+        mock.close()
+        await mock.wait_closed()
+        os.unlink(logpath)
+
+
+async def scenario_estimate_window_frozen_across_triggers():
+    """Without an engine log the decode window must still stop at the first
+    metrics-bearing chunk, not absorb the take() timeout plus the gap to the
+    usage chunk."""
+    gap = 0.4
+    mock = await asyncio.start_server(
+        make_mock_upstream(TWO_TRIGGER_EVENTS, gap=gap), "127.0.0.1", 0
+    )
+    mock_port = mock.sockets[0].getsockname()[1]
+    _, server, proxy_port = await start_sidecar_proxy(mock_port)
+    cap = LogCapture()
+    proxy_mod.log.addHandler(cap)
+    old_level = proxy_mod.log.level
+    proxy_mod.log.setLevel(logging.INFO)
+    try:
+        status, _, _, payloads = await post_chat(proxy_port)
+        assert status == 200
+        lines = cap.timing_lines()
+        assert len(lines) == 1, f"expected exactly one timings line, got {lines}"
+        assert "[estimate]" in lines[0], lines[0]
+        timings = json.loads(payloads[-2])["timings"]
+        # Chunks land at 0, g, 2g, 3g(finish), 4g(usage). First content is at
+        # g, so the frozen decode window is 2g = 0.8s. Unfrozen it would be
+        # 3g + the 0.8s take() stall = ~2.0s.
+        assert 0.3 < timings["predicted_ms"] / 1000.0 < 1.3, timings["predicted_ms"]
+        # No cache hint here, so the "too fast to be a cold prefill" ceiling
+        # owns the split: the reported prompt rate must not exceed it.
+        assert timings["prompt_n"] > 0
+        assert timings["prompt_per_second"] <= proxy_mod.PREFILL_CEILING + 1.0
+    finally:
+        proxy_mod.log.setLevel(old_level)
+        proxy_mod.log.removeHandler(cap)
+        server.close()
+        await server.wait_closed()
+        mock.close()
+        await mock.wait_closed()
+
+
+def test_new_log_format_drives_engine_path_once():
+    asyncio.run(scenario_new_log_format_single_line())
+
+
+def test_estimate_decode_window_is_frozen_at_first_trigger():
+    asyncio.run(scenario_estimate_window_frozen_across_triggers())

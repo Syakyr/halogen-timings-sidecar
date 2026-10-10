@@ -31,6 +31,15 @@ SERVE_API_SERIAL = (
     "serve_api: serial 100 tok in 4.0s = 25.0 t/s | prompt 500, prefill 2.0s"
 )
 
+# halogen-flash-server >= 0.17: cached paren carries a percentage, prefill
+# carries an explicit "(N new)".
+SERVE_API_MTP_NEW = (
+    "serve_api: mtp 57 tok in 0.90s = 63.42 t/s | 17 rounds, commit 3.29/round "
+    "| prompt 185972 (185594 cached, 99.8%), prefill 0.66s (378 new) "
+    "| detok 12us/tok | pld 10 rounds, 2.60 acc/round "
+    "| pool 494592/524288 94% | think on"
+)
+
 
 class TestEstimateTokens:
     def test_empty(self):
@@ -153,11 +162,13 @@ class TestPrefixMemory:
         other = {"model": "other", "messages": [{"role": "user", "content": "hi"}]}
         assert pm.lookup(other, 150) == 0
 
-    def test_lookup_capped_below_total(self):
+    def test_lookup_capped_at_total(self):
         pm = PrefixMemory()
         req = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
         pm.remember(req, 100, 20, "yo")
-        assert pm.lookup(req, 50) == 49
+        # A remembered grown prefix may exceed the current prompt; it can
+        # never claim more than the prompt itself.
+        assert pm.lookup(req, 50) == 50
 
     def test_lru_eviction(self):
         pm = PrefixMemory(max_entries=2)
@@ -174,8 +185,8 @@ class TestPrefixMemory:
         req = {"model": "m", "prompt": "hello world"}
         pm.remember(req, 50, 10, "gen")
         assert pm.lookup(req, 60) == 50
-        # lookup is capped at total_prompt - 1 (a full hit would mean no prefill).
-        assert pm.lookup({"model": "m", "prompt": "hello worldgen"}, 60) == 59
+        # A grown prefix may cover the whole prompt; a full hit is allowed.
+        assert pm.lookup({"model": "m", "prompt": "hello worldgen"}, 60) == 60
 
 
 class TestParseServeApiLine:
@@ -210,6 +221,30 @@ class TestParseServeApiLine:
     def test_non_matching_line(self):
         assert parse_serve_api_line("serving something else entirely") is None
 
+    def test_new_format_with_pct_and_new_count(self):
+        row = parse_serve_api_line(SERVE_API_MTP_NEW)
+        assert row is not None
+        assert row["drafter"] == "mtp"
+        assert row["predicted_n"] == 57
+        assert row["decode_s"] == 0.90
+        assert row["decode_tps"] == 63.42
+        assert row["prompt_total"] == 185972
+        assert row["cache_n"] == 185594
+        assert row["prompt_n"] == 378
+        assert row["prefill_s"] == 0.66
+        assert abs(row["prompt_tps"] - 378 / 0.66) < 1e-6
+        assert row["draft_n"] > 0
+        assert row["draft_n_accepted"] == 57 - 17
+
+    def test_explicit_new_count_beats_subtraction(self):
+        line = (
+            "serve_api: mtp 10 tok in 1.0s = 10.0 t/s "
+            "| prompt 100 (90 cached), prefill 0.5s (7 new)"
+        )
+        row = parse_serve_api_line(line)
+        assert row is not None
+        assert row["prompt_n"] == 7
+
     def test_zero_prefill_gives_zero_rate(self):
         line = (
             "serve_api: serial 5 tok in 1.0s = 5.0 t/s "
@@ -235,8 +270,18 @@ class TestSplitCachedPrompt:
         assert prompt_n == 900  # 1800 * 0.5
         assert cache_n == 1100
 
-    def test_hint_capped_at_total_minus_one(self):
-        assert split_cached_prompt(10, 10, 500.0) == (9, 1)
+    def test_hint_capped_at_total(self):
+        # A full hit means zero fresh prefill. The old prompt_n=1 floor charged
+        # the whole TTFT to one token ("prompt=1.4 tok/s" on a warm 185k prompt).
+        assert split_cached_prompt(10, 10, 500.0) == (10, 0)
+
+    def test_full_hit_reports_zero_rate_not_one_token(self):
+        t = build_timings(
+            t0=0.0, t_first=0.7, t_end=2.0, prompt_n=0, predicted_n=57, cache_n=185594
+        )
+        assert t["prompt_n"] == 0
+        assert t["prompt_per_second"] == 0.0
+        assert t["prompt_per_token_ms"] == 0.0
 
     def test_zero_total(self):
         assert split_cached_prompt(0, 0, 500.0) == (0, 0)

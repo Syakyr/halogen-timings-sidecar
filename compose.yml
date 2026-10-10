@@ -45,6 +45,13 @@ services:
     environment:
       HALOGEN_SIDECAR_UPSTREAM: api:8731
       HALOGEN_SIDECAR_LISTEN: 0.0.0.0:8731
+      # NOTE: in this split topology the api container runs the upstream
+      # entrypoint, which does not tee its stdout anywhere this container can
+      # read. So every request logs [estimate] here. The [serve_api] path is
+      # only wired in the single-container wrap.sh mode. To get real counts
+      # across the split, tee the api container's stdout onto a shared volume
+      # and point HALOGEN_UPSTREAM_LOG at it.
+      HALOGEN_UPSTREAM_LOG: /tmp/halogen-upstream.log
     ports:
       - "8731:8731"
     depends_on: [api]

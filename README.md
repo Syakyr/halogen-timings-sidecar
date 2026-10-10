@@ -135,7 +135,7 @@ curl -s "https://ghcr.io/token?scope=repository:syakyr/halogen-timings-sidecar:p
 | Field | Source |
 |---|---|
 | `prompt_ms` | request start → first non-empty `delta.content` / `reasoning_content` (TTFT) |
-| `predicted_ms` | first content → `finish_reason` chunk |
+| `predicted_ms` | first content → first metrics-bearing chunk (frozen there; later chunks never widen it) |
 | `prompt_n` / `predicted_n` | tee'd `serve_api` log line if present, else upstream `usage`, else a cheap CJK/latin estimate |
 | `cache_n` | `serve_api` log, else longest previously seen message prefix, else "too fast to be prefill" vs `HALOGEN_PREFILL_CEILING` (default 1800 tok/s) |
 
@@ -146,6 +146,35 @@ sidecar process to have seen the earlier turn (same container); the rate
 ceiling still fires on a cache hit even if the prefix table missed
 (restart, rewritten history). If a cold prefill is being marked cached,
 override with `-e HALOGEN_PREFILL_CEILING=1500`.
+
+### Log-format drift (why the source matters)
+
+Every sidecar log line is tagged with where its numbers came from:
+
+```
+halogen-sidecar: timings [serve_api] cache_n=185594 prompt_n=378 prompt=572.7 tok/s predicted_n=57 decode=63.4 tok/s ttft=0.694s
+```
+
+`[serve_api]` means the engine's own line was matched — those are real
+counts. `[estimate]` means it was not, and everything is inferred from
+HTTP wall time plus a character heuristic, which is rough (it has been
+seen 1.8× low on prompt tokens for CJK-heavy contexts). If a working
+GPU is logging `[estimate]` for every request, the tee'd line format has
+drifted from the parser: check `SERVE_API_RE` in `proxy.py` against a
+current `serve_api:` line before believing any number downstream.
+
+Halogen's line has changed shape before — the cached paren grew a
+percentage (`(185594 cached, 99.8%)`) and prefill grew an explicit
+`(378 new)`. Both are optional in the regex so older lines still parse.
+The sidecar logs **one line per request**, for the numbers it actually
+delivered; Halogen sends a `finish_reason` chunk and a separate `usage`
+chunk, and re-measuring between them used to charge the sidecar's own
+engine-log wait to the model's decode rate.
+
+A full prompt-cache hit is reported honestly as `prompt_n=0` /
+`prompt=0.0 tok/s`. It used to be floored at one token, which charged the
+whole TTFT to that token and produced "prompt=1.4 tok/s" on a warm 185k
+context.
 
 Non-stream responses pass through unchanged — inventing a single-bucket
 rate would silently attribute prefill to decode.
