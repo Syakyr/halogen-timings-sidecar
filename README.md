@@ -152,8 +152,14 @@ override with `-e HALOGEN_PREFILL_CEILING=1500`.
 Every sidecar log line is tagged with where its numbers came from:
 
 ```
-halogen-sidecar: timings [serve_api] cache_n=185594 prompt_n=378 prompt=572.7 tok/s predicted_n=57 decode=63.4 tok/s ttft=0.694s
+halogen-sidecar: timings [upstream] cache_n=48976 prompt_n=469 prompt=670.3 tok/s predicted_n=485 decode=51.9 tok/s ttft=0.709s draft_n=442 accepted=303 accept=0.69 prefix_n=49099
 ```
+
+`[upstream]` means Halogen supplied the `timings` object itself and it was
+passed through byte-for-byte — authoritative, and what you should expect on
+Halogen >= 0.17. The sidecar does not overwrite it, and it also surfaces
+the speculative-decode fields (`draft_n`, `accepted`, `accept`) that the
+engine line does not carry.
 
 `[serve_api]` means the engine's own line was matched — those are real
 counts. `[estimate]` means it was not, and everything is inferred from
@@ -165,7 +171,11 @@ current `serve_api:` line before believing any number downstream.
 
 Halogen's line has changed shape before — the cached paren grew a
 percentage (`(185594 cached, 99.8%)`) and prefill grew an explicit
-`(378 new)`. Both are optional in the regex so older lines still parse.
+`(378 new)`. The regex also tolerates `= n/a` (emitted when `n_gen <= 1`
+or `decode_ms <= 0`) and `prefill X.XXs = NNN t/s` (emitted when the new
+-token count is >= 2048), and treats every one of those segments as
+optional so older lines still parse.
+
 The sidecar logs **one line per request**, for the numbers it actually
 delivered; Halogen sends a `finish_reason` chunk and a separate `usage`
 chunk, and re-measuring between them used to charge the sidecar's own
@@ -176,8 +186,17 @@ A full prompt-cache hit is reported honestly as `prompt_n=0` /
 whole TTFT to that token and produced "prompt=1.4 tok/s" on a warm 185k
 context.
 
-Non-stream responses pass through unchanged — inventing a single-bucket
-rate would silently attribute prefill to decode.
+Non-stream responses pass through unchanged. The sidecar never synthesises
+a timing it was not given — inventing a single-bucket rate would silently
+attribute prefill to decode. On Halogen >= 0.17 that costs nothing: the
+engine already attaches its own `timings` object to non-stream responses
+(`prompt_n`, `predicted_n`, `prompt_ms`, `predicted_ms`, `prefix_n`), so
+llama-swap gets real prefill/decode splits there for free.
+
+Note the sidecar's `timings` log line is emitted from the streaming path
+only. A non-stream request produces no `halogen-sidecar:` log entry; if
+you are grepping the log and a request is missing, check whether it was
+`"stream": false` before concluding the sidecar skipped it.
 
 ## Two-container topology (optional)
 
