@@ -515,6 +515,32 @@ def filter_headers(
     return [(k, v) for k, v in headers if k.lower() not in drop]
 
 
+async def iter_chunked(src: asyncio.StreamReader):
+    """Yield decoded payloads from a chunked upstream body.
+
+    Without this the chunk-size lines are handed to the SSE splitter as if
+    they were events. We drop Transfer-Encoding from the response we emit, so
+    a strict client reads those hex sizes as body content -- verified live:
+    a decoded body starting b'104\\r\\ndata: {...'.
+    """
+    while True:
+        size_line = await src.readline()
+        if not size_line:
+            return
+        try:
+            size = int(size_line.split(b";", 1)[0].strip() or b"0", 16)
+        except ValueError:
+            return
+        if size == 0:
+            while True:  # trailing trailer lines, if any
+                trailer = await src.readline()
+                if not trailer or trailer in (b"\r\n", b"\n"):
+                    break
+            return
+        yield await src.readexactly(size)
+        await src.readline()  # CRLF terminating the chunk
+
+
 def encode_headers(status_line: str, headers: list[tuple[str, str]]) -> bytes:
     out = [status_line.rstrip() + "\r\n"]
     for k, v in headers:
@@ -734,7 +760,13 @@ class Sidecar:
                 await writer.drain()
 
                 if is_sse:
-                    await self._pipe_sse(up_r, writer, req)
+                    await self._pipe_sse(
+                        up_r,
+                        writer,
+                        req,
+                        chunked="chunked"
+                        in up_map.get("transfer-encoding", "").lower(),
+                    )
                 else:
                     if rewrite and "application/json" in ctype:
                         raw = await self._read_rest(up_r, up_map)
@@ -800,6 +832,7 @@ class Sidecar:
         src: asyncio.StreamReader,
         dst: asyncio.StreamWriter,
         req: dict,
+        chunked: bool = False,
     ) -> None:
         t0 = time.perf_counter()
         started_mono = time.monotonic()
@@ -850,12 +883,18 @@ class Sidecar:
                 f" prefix_n={prefix_n}" if prefix_n else "",
             )
 
-        while True:
-            chunk = await src.read(64 * 1024)
-            if not chunk:
-                if buf:
-                    await emit(buf)
-                break
+        async def upstream_bytes():
+            if chunked:
+                async for blob in iter_chunked(src):
+                    yield blob
+            else:
+                while True:
+                    blob = await src.read(64 * 1024)
+                    if not blob:
+                        return
+                    yield blob
+
+        async for chunk in upstream_bytes():
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -1022,6 +1061,8 @@ class Sidecar:
                 await emit(new_line.encode("utf-8") + b"\n")
                 pending = {"source": source, "timings": timings, "ttft_s": ttft_s}
 
+        if buf:
+            await emit(buf)
         flush_log()
 
 

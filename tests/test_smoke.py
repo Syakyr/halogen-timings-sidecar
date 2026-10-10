@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import sys
 
@@ -88,11 +89,13 @@ def free_port() -> int:
     return port
 
 
-def make_mock_upstream(events, gap=0.03):
+def make_mock_upstream(events, gap=0.03, chunked=False):
     """Build a stub Halogen SSE server for the given events.
 
     `gap` is the pause between chunks; tests widen the gap after a
     metrics-bearing chunk to simulate the sidecar's own engine-log wait.
+    `chunked` makes the upstream use HTTP chunked transfer encoding, which
+    is what uvicorn/Halogen actually do.
     """
 
     async def handler(reader, writer):
@@ -135,15 +138,30 @@ def make_mock_upstream(events, gap=0.03):
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/event-stream\r\n"
-            b"Cache-Control: no-cache\r\n\r\n"
+            b"Cache-Control: no-cache\r\n"
+            + (
+                b"Transfer-Encoding: chunked\r\n"
+                if chunked
+                else b"Content-Length: 0\r\n"
+            )
+            + b"\r\n"
         )
         await writer.drain()
-        for event in events:
-            writer.write(f"data: {json.dumps(event)}\n\n".encode())
+
+        async def send(payload: bytes) -> None:
+            if chunked:
+                writer.write(b"%x\r\n%s\r\n" % (len(payload), payload))
+            else:
+                writer.write(payload)
             await writer.drain()
+
+        for event in events:
+            await send(f"data: {json.dumps(event)}\n\n".encode())
             await asyncio.sleep(gap)
-        writer.write(b"data: [DONE]\n\n")
-        await writer.drain()
+        await send(b"data: [DONE]\n\n")
+        if chunked:
+            writer.write(b"0\r\n\r\n")
+            await writer.drain()
         writer.close()
         await writer.wait_closed()
 
@@ -538,3 +556,46 @@ async def scenario_upstream_timings_are_authoritative():
 
 def test_upstream_timings_pass_through_and_log_as_upstream():
     asyncio.run(scenario_upstream_timings_are_authoritative())
+
+
+async def scenario_chunked_upstream_is_decoded():
+    """A chunked upstream must not leak its hex size lines into our body.
+
+    The sidecar drops Transfer-Encoding from the response, so any framing it
+    passes through becomes literal content for a strict client. Live capture
+    through llama-swap showed a decoded body starting b'104\\r\\ndata: {...'.
+    """
+    mock = await asyncio.start_server(
+        make_mock_upstream(MOCK_EVENTS, chunked=True), "127.0.0.1", 0
+    )
+    mock_port = mock.sockets[0].getsockname()[1]
+    _, server, proxy_port = await start_sidecar_proxy(mock_port)
+    try:
+        status, headers, rest, payloads = await post_chat(proxy_port)
+        assert status == 200
+        assert "chunked" not in headers.get("transfer-encoding", "").lower()
+
+        body = rest.decode("utf-8", errors="replace")
+        hex_framing = [
+            ln
+            for ln in body.split("\n")
+            if ln.strip() and re.fullmatch(r"[0-9a-fA-F]+", ln.strip())
+        ]
+        assert not hex_framing, f"chunk-size lines leaked into the body: {hex_framing}"
+        assert not re.match(r"^[0-9a-fA-F]+\r?\ndata:", body), body[:40]
+
+        # Every event still arrived, and the stop chunk is still patched.
+        assert payloads[-1] == "[DONE]"
+        assert len(payloads) == len(MOCK_EVENTS) + 1
+        stop = json.loads(payloads[-2])
+        assert stop["choices"][0]["finish_reason"] == "stop"
+        assert stop["timings"]["predicted_per_second"] > 0
+    finally:
+        server.close()
+        await server.wait_closed()
+        mock.close()
+        await mock.wait_closed()
+
+
+def test_chunked_upstream_framing_does_not_leak():
+    asyncio.run(scenario_chunked_upstream_is_decoded())
