@@ -245,6 +245,70 @@ class TestParseServeApiLine:
         assert row is not None
         assert row["prompt_n"] == 7
 
+    # Shapes taken from the upstream f-string in serve_api.py (~line 2644).
+    def test_na_rate_when_single_token(self):
+        # rate is "n/a" when n_gen <= 1 or decode_ms <= 0; the old regex
+        # required a number here and dropped the whole line.
+        line = (
+            "serve_api: batch 1 tok in 0.00s = n/a "
+            "| prompt 500, prefill 0.50s (500 new) | detok 15us/tok"
+        )
+        row = parse_serve_api_line(line)
+        assert row is not None
+        assert row["predicted_n"] == 1
+        assert row["decode_s"] == 0.0
+        assert row["decode_tps"] == 0.0
+        assert row["prompt_n"] == 500
+
+    def test_na_rate_still_derives_rate_when_time_nonzero(self):
+        line = (
+            "serve_api: batch 1 tok in 0.04s = n/a "
+            "| prompt 500, prefill 0.50s (500 new) | detok 15us/tok"
+        )
+        row = parse_serve_api_line(line)
+        assert row is not None
+        assert row["decode_tps"] == 25.0
+
+    def test_prefill_rate_form_above_min_tokens(self):
+        # pf_n >= PREFILL_RATE_MIN_TOKENS (2048) prints "= NNN t/s"
+        # instead of "(N new)".
+        line = (
+            "serve_api: mtp 200 tok in 3.00s = 66.67 t/s "
+            "| 80 rounds, commit 2.50/round "
+            "| prompt 8192 (2048 cached, 25.0%), prefill 6.00s = 1024 t/s "
+            "| detok 12us/tok"
+        )
+        row = parse_serve_api_line(line)
+        assert row is not None
+        assert row["prompt_total"] == 8192
+        assert row["cache_n"] == 2048
+        assert row["prompt_n"] == 6144
+        assert abs(row["prompt_tps"] - 1024.0) < 1e-6
+
+    def test_full_cache_hit_line(self):
+        line = (
+            "serve_api: mtp 40 tok in 1.00s = 40.00 t/s "
+            "| 20 rounds, commit 2.00/round "
+            "| prompt 185972 (185972 cached, 100.0%), prefill 0.00s "
+            "| detok 11us/tok"
+        )
+        row = parse_serve_api_line(line)
+        assert row is not None
+        assert row["prompt_n"] == 0
+        assert row["cache_n"] == 185972
+        assert row["prompt_tps"] == 0.0
+
+    def test_dflash2_and_batch_drafter_names(self):
+        for name in ("dflash2", "spec", "batch", "mtp"):
+            line = (
+                f"serve_api: {name} 90 tok in 2.00s = 45.00 t/s "
+                f"| prompt 1000 (500 cached, 50.0%), prefill 0.50s (500 new) "
+                f"| detok 12us/tok"
+            )
+            row = parse_serve_api_line(line)
+            assert row is not None, name
+            assert row["drafter"] == name
+
     def test_zero_prefill_gives_zero_rate(self):
         line = (
             "serve_api: serial 5 tok in 1.0s = 5.0 t/s "

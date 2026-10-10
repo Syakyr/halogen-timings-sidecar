@@ -207,13 +207,21 @@ UPSTREAM_LOG = os.environ.get("HALOGEN_UPSTREAM_LOG", "/tmp/halogen-upstream.log
 # the estimate path while the engine's real numbers sat unread in the log.
 # Both additions are optional, so the bare form ("prompt 500, prefill 2.0s")
 # still parses.
+# Mirrors the f-string in upstream serve_api.py (~line 2644). Shapes that
+# have bitten us; each is optional so older lines still parse:
+#   "(N cached)"          -> "(N cached, 99.8%)"
+#   prefill "(N new)"     -> when pf_n < PREFILL_RATE_MIN_TOKENS (2048)
+#   prefill "= NNN t/s"   -> when pf_n >= 2048
+#   "= n/a"               -> when n_gen <= 1 or decode_ms <= 0
+# "tok in Xs" is decode_ms/1000: the decode window only. Prefill is
+# reported separately and is NOT inside X.
 SERVE_API_RE = re.compile(
-    r"serve_api:\s+(\S+)\s+(\d+)\s+tok\s+in\s+([\d.]+)s\s+=\s+([\d.]+)\s+t/s"
+    r"serve_api:\s+(\S+)\s+(\d+)\s+tok\s+in\s+([\d.]+)s\s+=\s+(?:([\d.]+)\s+t/s|n/a)"
     r"(?:\s+\|\s+(\d+)\s+rounds,\s+commit\s+([\d.]+)/round)?"
     r".*?\|\s+prompt\s+(\d+)"
     r"(?:\s*\(\s*(\d+)\s+cached[^()]*\))?"
     r"\s*,\s*prefill\s+([\d.]+)s"
-    r"(?:\s*\(\s*(\d+)\s+new\s*\))?"
+    r"(?:\s*\(\s*(\d+)\s+new\s*\)|\s+=\s+(\d+)\s+t/s)?"
 )
 
 
@@ -224,7 +232,13 @@ def parse_serve_api_line(line: str) -> dict | None:
     drafter = m.group(1)
     predicted_n = int(m.group(2))
     decode_s = float(m.group(3))
-    decode_tps = float(m.group(4))
+    # "n/a" (n_gen <= 1 or decode_ms <= 0) leaves group 4 unset; derive
+    # the rate rather than reporting 0 for a request that really ran.
+    decode_tps = (
+        float(m.group(4))
+        if m.group(4) is not None
+        else (predicted_n / decode_s if decode_s > 0 else 0.0)
+    )
     rounds = int(m.group(5) or 0)
     commit_per_round = float(m.group(6) or 0.0)
     prompt_total = int(m.group(7))
