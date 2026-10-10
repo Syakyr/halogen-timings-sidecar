@@ -449,3 +449,92 @@ def test_new_log_format_drives_engine_path_once():
 
 def test_estimate_decode_window_is_frozen_at_first_trigger():
     asyncio.run(scenario_estimate_window_frozen_across_triggers())
+
+
+# Captured from a live halogen-flash-server 0.17.3 stream. Halogen now ships
+# its own llama.cpp-shaped timings; the sidecar must not pretend its own
+# estimate reached the wire.
+UPSTREAM_TIMINGS = {
+    "prompt_n": 57,
+    "predicted_n": 8,
+    "prompt_ms": 1490.7,
+    "predicted_ms": 233.8,
+    "prompt_per_second": 38.237,
+    "predicted_per_second": 34.217,
+    "cache_n": 0,
+    "disk_restore_n": 0,
+    "disk_restore_ms": 0.0,
+    "prefix_n": 49,
+    "draft_n": 0,
+    "draft_n_accepted": 0,
+}
+
+UPSTREAM_TIMING_EVENTS = [
+    {"choices": [{"delta": {"role": "assistant"}}]},
+    {"choices": [{"delta": {"content": "pong"}}]},
+    {
+        "choices": [{"finish_reason": "length", "delta": {}}],
+        "usage": {
+            "prompt_tokens": 57,
+            "completion_tokens": 8,
+            "total_tokens": 65,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        },
+        "timings": UPSTREAM_TIMINGS,
+    },
+    {
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 57,
+            "completion_tokens": 8,
+            "total_tokens": 65,
+            "prompt_tokens_details": {"cached_tokens": 56},
+        },
+        "timings": UPSTREAM_TIMINGS,
+    },
+]
+
+
+async def scenario_upstream_timings_are_authoritative():
+    """With Halogen's own timings on the wire the sidecar must pass them
+    through untouched, log [upstream], and not stall on the engine log."""
+    mock = await asyncio.start_server(
+        make_mock_upstream(UPSTREAM_TIMING_EVENTS), "127.0.0.1", 0
+    )
+    mock_port = mock.sockets[0].getsockname()[1]
+    _, server, proxy_port = await start_sidecar_proxy(mock_port)
+    cap = LogCapture()
+    proxy_mod.log.addHandler(cap)
+    old_level = proxy_mod.log.level
+    proxy_mod.log.setLevel(logging.INFO)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        status, _, _, payloads = await post_chat(proxy_port)
+        elapsed = loop.time() - started
+        assert status == 200
+        lines = cap.timing_lines()
+        assert len(lines) == 1, f"expected exactly one timings line, got {lines}"
+        assert "[upstream]" in lines[0], lines[0]
+        assert "prefix_n=49" in lines[0], lines[0]
+
+        last = json.loads(payloads[-2])
+        # Byte-for-byte the upstream object: nothing of ours leaked in, and
+        # none of its fields were overwritten by an estimate.
+        assert last["timings"] == UPSTREAM_TIMINGS
+        assert last["usage"]["prompt_tokens_details"]["cached_tokens"] == 56
+
+        # The old path blocked up to 0.8s in ServeApiLog.take() for a number
+        # it then threw away. 4 chunks at 30ms should never approach that.
+        assert elapsed < 0.6, f"sidecar stalled {elapsed:.2f}s on the engine log"
+    finally:
+        proxy_mod.log.setLevel(old_level)
+        proxy_mod.log.removeHandler(cap)
+        server.close()
+        await server.wait_closed()
+        mock.close()
+        await mock.wait_closed()
+
+
+def test_upstream_timings_pass_through_and_log_as_upstream():
+    asyncio.run(scenario_upstream_timings_are_authoritative())

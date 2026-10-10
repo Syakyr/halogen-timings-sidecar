@@ -816,22 +816,24 @@ class Sidecar:
             draft_n = t.get("draft_n") or 0
             accepted = t.get("draft_n_accepted") or 0
             accept = (accepted / draft_n) if draft_n else 0.0
+            prefix_n = t.get("prefix_n")
             log.info(
                 "timings [%s] cache_n=%s prompt_n=%s prompt=%.1f tok/s "
                 "predicted_n=%s decode=%.1f tok/s ttft=%.3fs"
-                "%s",
+                "%s%s",
                 pending["source"],
-                t["cache_n"],
-                t["prompt_n"],
-                t["prompt_per_second"],
-                t["predicted_n"],
-                t["predicted_per_second"],
+                t.get("cache_n", 0),
+                t.get("prompt_n", 0),
+                t.get("prompt_per_second", 0.0),
+                t.get("predicted_n", 0),
+                t.get("predicted_per_second", 0.0),
                 pending["ttft_s"],
                 (
                     f" draft_n={draft_n} accepted={accepted} accept={accept:.2f}"
                     if draft_n
                     else ""
                 ),
+                f" prefix_n={prefix_n}" if prefix_n else "",
             )
 
         while True:
@@ -885,6 +887,29 @@ class Sidecar:
                         if t_first is None:
                             t_first = time.perf_counter()
                         gen_text.append(piece)
+
+                # Halogen >= 0.17 ships its own llama.cpp-shaped timings
+                # (prompt_n/predicted_n/cache_n/prefix_n/disk_restore_*). attach_metrics()
+                # has always refused to clobber one, so every estimate computed
+                # here was silently discarded on the wire while still being
+                # logged as if delivered. Treat an upstream object as
+                # authoritative: pass it through untouched and say so.
+                up_timings = obj.get("timings")
+                if isinstance(up_timings, dict) and up_timings.get(
+                    "predicted_per_second"
+                ):
+                    ttft_s = (
+                        (t_first - t0)
+                        if t_first is not None
+                        else (time.perf_counter() - t0)
+                    )
+                    pending = {
+                        "source": "upstream",
+                        "timings": up_timings,
+                        "ttft_s": ttft_s,
+                    }
+                    await emit(line + b"\n")
+                    continue
 
                 if finish_reason_of(obj) is None and not (
                     isinstance(obj.get("timings"), dict)
