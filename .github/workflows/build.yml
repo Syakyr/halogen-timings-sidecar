@@ -20,6 +20,8 @@ env:
 jobs:
   lint-test:
     runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.tests.outputs.summary }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,19 +36,32 @@ jobs:
         run: uv run ruff format --check .
 
       - name: Tests + coverage
-        run: >
-          uv run pytest --cov=proxy --cov-branch
-          --cov-report=term-missing --cov-fail-under=75
+        id: tests
+        run: |
+          set -euo pipefail
+          uv run pytest --cov=proxy --cov-branch \
+            --cov-report=term-missing --cov-fail-under=75 2>&1 | tee pytest.log
+          # Carried into the release notes so the published artifact names the
+          # run that actually produced it.
+          passed="$(grep -oE '[0-9]+ passed[^=]*' pytest.log | tail -1 || true)"
+          cov="$(grep -E '^TOTAL' pytest.log | grep -oE '[0-9]+%' | tail -1 || true)"
+          echo "summary=${passed}${cov:+, coverage ${cov}}" >> "$GITHUB_OUTPUT"
 
   image:
     needs: lint-test
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # publish the release notes
       packages: write
     steps:
+      # Full history: the release notes diff our commits against the previous
+      # release tag, which a default shallow checkout does not carry.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
 
       - name: Resolve versions
         id: ver
@@ -74,6 +89,7 @@ jobs:
             echo "sidecar=$N"
             echo "is_latest=$IS_LATEST"
             echo "image=$IMAGE"
+            echo "tag=$HALOGEN-sidecar$N"
           } >> "$GITHUB_OUTPUT"
           echo "Building sidecar for halogen $HALOGEN (build #$N, latest=$IS_LATEST) -> $IMAGE"
 
@@ -86,6 +102,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -98,3 +115,46 @@ jobs:
             ${{ steps.ver.outputs.is_latest == 'yes' && format('ghcr.io/{0}:latest', steps.ver.outputs.image) || '' }}
           cache-from: type=gha,scope=image-${{ steps.ver.outputs.halogen }}
           cache-to: type=gha,scope=image-${{ steps.ver.outputs.halogen }},mode=max
+
+      # One release per published pairing, the ledger llama-swap-podman and
+      # code-server-paseo keep: the tag names the upstream version, so the
+      # release list is the history of what each image actually baked.
+      - name: Publish release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          IMAGE: ghcr.io/${{ steps.ver.outputs.image }}:${{ steps.ver.outputs.tag }}
+          HALOGEN: ${{ steps.ver.outputs.halogen }}
+          SIDECAR: ${{ steps.ver.outputs.sidecar }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TESTS: ${{ needs.lint-test.outputs.tests }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Idempotent and non-destructive: hand-written notes are richer than
+          # anything generated here, so an existing release is left alone rather
+          # than overwritten on a re-run.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; leaving it alone"
+            exit 0
+          fi
+
+          # "What moved" is computed against the previously published release,
+          # not from memory. gh api exits non-zero with no release yet, which is
+          # the empty-prev case the script handles.
+          PREV="$(gh api "repos/${{ github.repository }}/releases/latest" \
+            --jq .tag_name 2>/dev/null || true)"
+
+          uv run scripts/make_release_notes.py \
+            --tag "$TAG" --halogen "$HALOGEN" --sidecar "$SIDECAR" \
+            --image "$IMAGE" --repo "${{ github.repository }}" \
+            --prev-tag "$PREV" --digest "$DIGEST" --tests "$TESTS" \
+            --run-url "$RUN_URL" > "$RUNNER_TEMP/release-notes.md"
+
+          # The watcher pushes the provenance tag before dispatching this build,
+          # so the tag normally exists; when it does not (a manual dispatch for a
+          # version never tagged), gh creates it at the commit CI built here.
+          gh release create "$TAG" --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          echo "published release $TAG" >> "$GITHUB_STEP_SUMMARY"
