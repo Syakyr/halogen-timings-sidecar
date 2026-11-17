@@ -6,3 +6,6 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
+# Local scratch, including the serve_api.py / npu_api.py copies pulled out of
+# a Halogen image to check the log parser against. Upstream code: keep it out.
+scratch/

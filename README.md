@@ -92,6 +92,13 @@ and `compose.yml` defaults) in sync with the newest upstream release via a
 old base. Manual runs pinned to an older `halogen_version` skip the sync —
 defaults track newest-only.
 
+Every published build also gets a GitHub release. After the image push,
+`build.yml` runs `scripts/make_release_notes.py`, which records the base
+version the image baked, upstream's own changelog summary for that version,
+our commits since the previous release, the manifest digest, and the test
+summary from the same run. It leaves an existing release alone, so
+hand-written notes survive a re-run.
+
 <details>
 <summary>Don't want to wait up to 6 hours for a fresh upstream tag?</summary>
 
@@ -141,7 +148,7 @@ curl -s "https://ghcr.io/token?scope=repository:syakyr/halogen-timings-sidecar:p
 
 This is HTTP-visible wall time, not Halogen's internal GEMM clocks.
 Prefill tok/s sits a few percent under `sweep`; decode tok/s is close.
-`cache_n` is inferred — Halogen does not send it. Prefix memory needs the
+`cache_n` is inferred on the estimate path; Halogen >= 0.17 sends its own. Prefix memory needs the
 sidecar process to have seen the earlier turn (same container); the rate
 ceiling still fires on a cache hit even if the prefix table missed
 (restart, rewritten history). If a cold prefill is being marked cached,
@@ -159,7 +166,10 @@ halogen-sidecar: timings [upstream] cache_n=48976 prompt_n=469 prompt=670.3 tok/
 passed through byte-for-byte — authoritative, and what you should expect on
 Halogen >= 0.17. The sidecar does not overwrite it, and it also surfaces
 the speculative-decode fields (`draft_n`, `accepted`, `accept`) that the
-engine line does not carry.
+engine line does not carry. A `timings` object counts as upstream when it
+carries `prompt_n`/`predicted_n` or a decode rate: a one-token reply
+reports `predicted_per_second: 0.0`, and treating that as "no upstream
+numbers" handed those requests to the estimator.
 
 `[serve_api]` means the engine's own line was matched — those are real
 counts. `[estimate]` means it was not, and everything is inferred from
@@ -175,6 +185,21 @@ percentage (`(185594 cached, 99.8%)`) and prefill grew an explicit
 or `decode_ms <= 0`) and `prefill X.XXs = NNN t/s` (emitted when the new
 -token count is >= 2048), and treats every one of those segments as
 optional so older lines still parse.
+
+Checked against `serve_api.py` as extracted from the 0.20.6 image: the
+ledger line is unchanged through the prefill field, and everything newer
+is appended after it (`| N tok with the head off`, `| pld …`, `| pool …`,
+`| max_tokens clamped …`, `| think …`, `| disk: restored …`,
+`| closest earlier: …`), which the parser ignores by construction.
+`tests/test_unit.py::SERVE_API_0206_TAIL` pins that.
+
+Two derived counters on the `[serve_api]` path are approximate where
+Halogen's own `timings` object is exact, because the log line no longer
+carries enough to reconstruct them: the printed `commit X/round` now
+subtracts the shared-prefix tokens (`| N tok with the head off`) while
+`n_gen` still includes them, and `rounds` folds the prompt-lookup and
+grammar drafters in with the head. Upstream timings sidestep both, so this
+only bites on the fallback path.
 
 The sidecar logs **one line per request**, for the numbers it actually
 delivered; Halogen sends a `finish_reason` chunk and a separate `usage`
@@ -197,6 +222,17 @@ Note the sidecar's `timings` log line is emitted from the streaming path
 only. A non-stream request produces no `halogen-sidecar:` log entry; if
 you are grepping the log and a request is missing, check whether it was
 `"stream": false` before concluding the sidecar skipped it.
+
+### Reading the numbers in llama-swap
+
+llama-swap v269 (upstream PR #1292) changed what its Activity table calls
+`Prompt`: it is now `prompt_n + cache_n`, the whole prompt, with the reused
+part broken out into the `Cached` column. Before v269 that column showed
+`prompt_n` alone, the freshly prefilled tail, which is the smaller number
+older screenshots show. Halogen's `prompt_n` has excluded the cached prefix
+since its own 0.8.0, so `Prompt − Cached` is the fresh prefill on any
+version, and `prompt_per_second` is measured over those tokens rather than
+the whole prompt.
 
 ## Two-container topology (optional)
 
@@ -241,7 +277,8 @@ passthrough, 503-during-cold-load, CLI boot).
 git tag <halogen>-sidecar<N> && git push origin <halogen>-sidecar<N>
 # e.g. git tag 0.11.2-sidecar2 && git push origin 0.11.2-sidecar2
 # → build.yml runs lint/tests, then publishes
-#   :<halogen>-sidecarN (immutable) and moves :<halogen> to it
+#   :<halogen>-sidecarN (immutable), moves :<halogen> to it,
+#   and opens the matching GitHub release
 ```
 
 `workflow_dispatch` on `build.yml` does the same interactively. The
