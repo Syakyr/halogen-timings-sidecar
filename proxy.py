@@ -454,10 +454,25 @@ def build_timings(
     }
 
 
+def upstream_timings(obj: dict) -> dict | None:
+    """Halogen's own `timings` object when this chunk carries one.
+
+    Keyed on the token counts as well as the rate: a one-token reply reports
+    `predicted_per_second: 0.0` and a fully cached prompt reports
+    `prompt_per_second: 0.0`, so a rate-only test discarded the engine's real
+    numbers on exactly those requests and replaced them with estimates.
+    """
+    t = obj.get("timings")
+    if not isinstance(t, dict):
+        return None
+    if "prompt_n" in t or "predicted_n" in t or t.get("predicted_per_second"):
+        return t
+    return None
+
+
 def attach_metrics(obj: dict, timings: dict, usage: dict | None) -> dict:
     # Do not clobber a real upstream timings object if Halogen grows one.
-    existing = obj.get("timings")
-    if not (isinstance(existing, dict) and existing.get("predicted_per_second")):
+    if upstream_timings(obj) is None:
         obj["timings"] = timings
     if usage:
         obj["usage"] = usage
@@ -947,10 +962,8 @@ class Sidecar:
                 # here was silently discarded on the wire while still being
                 # logged as if delivered. Treat an upstream object as
                 # authoritative: pass it through untouched and say so.
-                up_timings = obj.get("timings")
-                if isinstance(up_timings, dict) and up_timings.get(
-                    "predicted_per_second"
-                ):
+                up_timings = upstream_timings(obj)
+                if isinstance(up_timings, dict):
                     ttft_s = (
                         (t_first - t0)
                         if t_first is not None
@@ -964,9 +977,8 @@ class Sidecar:
                     await emit(line + b"\n")
                     continue
 
-                if finish_reason_of(obj) is None and not (
-                    isinstance(obj.get("timings"), dict)
-                    and obj["timings"].get("predicted_per_second")
+                if finish_reason_of(obj) is None and not isinstance(
+                    obj.get("timings"), dict
                 ):
                     await emit(line + b"\n")
                     continue

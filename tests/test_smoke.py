@@ -558,6 +558,68 @@ def test_upstream_timings_pass_through_and_log_as_upstream():
     asyncio.run(scenario_upstream_timings_are_authoritative())
 
 
+# A one-token reply (max_tokens=1, or a forced tool call) has no decode to
+# rate: predicted_ms and predicted_per_second are 0.0 while prompt_n and
+# cache_n are still exact. Keying authority on a nonzero rate handed these
+# requests to the estimator.
+UPSTREAM_TIMINGS_ONE_TOKEN = {
+    "prompt_n": 57,
+    "predicted_n": 1,
+    "prompt_ms": 1490.7,
+    "predicted_ms": 0.0,
+    "prompt_per_second": 38.237,
+    "predicted_per_second": 0.0,
+    "cache_n": 56,
+}
+
+ONE_TOKEN_EVENTS = [
+    {"choices": [{"delta": {"role": "assistant"}}]},
+    {"choices": [{"delta": {"content": "x"}}]},
+    {
+        "choices": [{"finish_reason": "length", "delta": {}}],
+        "usage": {
+            "prompt_tokens": 57,
+            "completion_tokens": 1,
+            "total_tokens": 58,
+            "prompt_tokens_details": {"cached_tokens": 56},
+        },
+        "timings": UPSTREAM_TIMINGS_ONE_TOKEN,
+    },
+]
+
+
+async def scenario_zero_rate_upstream_timings_pass_through():
+    mock = await asyncio.start_server(
+        make_mock_upstream(ONE_TOKEN_EVENTS), "127.0.0.1", 0
+    )
+    mock_port = mock.sockets[0].getsockname()[1]
+    _, server, proxy_port = await start_sidecar_proxy(mock_port)
+    cap = LogCapture()
+    proxy_mod.log.addHandler(cap)
+    old_level = proxy_mod.log.level
+    proxy_mod.log.setLevel(logging.INFO)
+    try:
+        status, _, _, payloads = await post_chat(proxy_port)
+        assert status == 200
+        lines = cap.timing_lines()
+        assert len(lines) == 1, f"expected exactly one timings line, got {lines}"
+        assert "[upstream]" in lines[0], lines[0]
+        stop = json.loads(payloads[-2])
+        assert stop["timings"] == UPSTREAM_TIMINGS_ONE_TOKEN
+        assert stop["usage"]["prompt_tokens_details"]["cached_tokens"] == 56
+    finally:
+        proxy_mod.log.setLevel(old_level)
+        proxy_mod.log.removeHandler(cap)
+        server.close()
+        await server.wait_closed()
+        mock.close()
+        await mock.wait_closed()
+
+
+def test_zero_rate_upstream_timings_pass_through():
+    asyncio.run(scenario_zero_rate_upstream_timings_pass_through())
+
+
 async def scenario_chunked_upstream_is_decoded():
     """A chunked upstream must not leak its hex size lines into our body.
 

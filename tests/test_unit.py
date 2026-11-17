@@ -18,6 +18,7 @@ from proxy import (
     prefix_fingerprint,
     prompt_fingerprint,
     split_cached_prompt,
+    upstream_timings,
     usage_of,
 )
 
@@ -38,6 +39,25 @@ SERVE_API_MTP_NEW = (
     "| prompt 185972 (185594 cached, 99.8%), prefill 0.66s (378 new) "
     "| detok 12us/tok | pld 10 rounds, 2.60 acc/round "
     "| pool 494592/524288 94% | think on"
+)
+
+
+# 0.20.6 adds the clauses after prefill: shared draft tokens, the KV pool,
+# a clamped max_tokens, the think-block decision, a disk restore, and the
+# closest-earlier-request note. Everything after the prefill field is
+# decoration the parser must keep ignoring.
+SERVE_API_0206_TAIL = (
+    "serve_api: dflash2 120 tok in 4.00s = 30.00 t/s "
+    "| 60 rounds, commit 1.50/round "
+    "| prompt 5000 (4000 cached, 80.0%), prefill 1.00s (1000 new) "
+    "| detok 40us/tok | 12 tok with the head off "
+    "| pld 30 rounds, 1.20 acc/round | pool 12000/262144 5% "
+    "| max_tokens clamped 8192 -> 4096 "
+    "| think off, closed at 12 by the end-of-turn guard "
+    "| disk: restored 40 rows in 120 ms | GPU queues evicted 300 ms "
+    "| strict tools 2 of 3 enforced (grammar) "
+    "| closest earlier: 3000 tokens shared with a request 12s ago, "
+    "then its prompt differs"
 )
 
 
@@ -297,6 +317,38 @@ class TestParseServeApiLine:
         assert row["prompt_n"] == 0
         assert row["cache_n"] == 185972
         assert row["prompt_tps"] == 0.0
+
+    def test_trailing_clauses_are_ignored(self):
+        row = parse_serve_api_line(SERVE_API_0206_TAIL)
+        assert row is not None
+        assert row["drafter"] == "dflash2"
+        assert row["prompt_total"] == 5000
+        assert row["cache_n"] == 4000
+        assert row["prompt_n"] == 1000
+        assert row["prefill_s"] == 1.00
+        assert row["decode_tps"] == 30.0
+
+
+class TestUpstreamTimings:
+    def test_counts_beat_rates(self):
+        # A one-token reply reports predicted_per_second 0.0; the counts are
+        # still the engine's own and must win over an estimate.
+        obj = {"timings": {"prompt_n": 40, "predicted_n": 1, "predicted_per_second": 0}}
+        assert upstream_timings(obj) == obj["timings"]
+
+    def test_absent(self):
+        assert upstream_timings({}) is None
+        assert upstream_timings({"timings": []}) is None
+        assert upstream_timings({"timings": {"draft_n": 3}}) is None
+
+    def test_rates_alone_still_count_as_upstream(self):
+        obj = {"timings": {"predicted_per_second": 30.0}}
+        assert upstream_timings(obj) is obj["timings"]
+
+    def test_attach_metrics_keeps_upstream_zero_rates(self):
+        obj = {"timings": {"prompt_n": 40, "predicted_n": 1, "cache_n": 40}}
+        attach_metrics(obj, {"prompt_n": 999, "predicted_n": 1}, None)
+        assert obj["timings"]["prompt_n"] == 40
 
     def test_dflash2_and_batch_drafter_names(self):
         for name in ("dflash2", "spec", "batch", "mtp"):
